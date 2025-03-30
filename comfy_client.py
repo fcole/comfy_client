@@ -10,16 +10,6 @@ from datetime import datetime
 import difflib
 import re
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Filter out websockets debug messages
-logging.getLogger('websockets').setLevel(logging.WARNING)
-logging.getLogger('websockets.client').setLevel(logging.WARNING)
 
 @dataclass
 class QueuedPrompt:
@@ -45,11 +35,14 @@ class UnusedColumnsError(Exception):
 
 class ComfyClient:
     def __init__(self, host: str = "127.0.0.1", port: Optional[int] = None):
+        self.logger = logging.getLogger(__name__)
         self.host = host
         self.port = port
         self.base_url = None
         self.ws_url = None
         self.ws = None
+        self.ws_logger = logging.getLogger('comfy_client.websocket')
+        self.ws_logger.setLevel(logging.WARNING)
         self.prompt_queue = asyncio.Queue()
         self.current_prompt: Optional[QueuedPrompt] = None
         self.prompt_futures: Dict[str, asyncio.Future] = {}  # Map prompt_id to Future
@@ -68,15 +61,14 @@ class ComfyClient:
     async def _check_port(self, port: int) -> Optional[int]:
         """Check if a port is running ComfyUI."""
         try:
-            logger.info(f"Checking if port {port} is running ComfyUI...")
+            self.logger.info(f"Checking if port {port} is running ComfyUI...")
             async with aiohttp.ClientSession() as session:
                 async with session.get(f"http://127.0.0.1:{port}/system_stats", timeout=5) as response:
-                    logger.info(f"Response status code: {response.status}")
                     if response.status == 200:
-                        logger.info(f"Found ComfyUI server on port {port}")
+                        self.logger.info(f"Found ComfyUI server on port {port}")
                         return port
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.info(f"Port {port} is not running ComfyUI: {e}")
+            self.logger.info(f"Port {port} is not running ComfyUI: {e}")
         return None
 
     async def _parse_port_from_line(self, line: str) -> Optional[int]:
@@ -87,21 +79,20 @@ class ComfyClient:
         # Match port number after the last colon in the line
         match = re.search(r':(\d+)\s*\(LISTEN\)$', line)
         if not match:
-            logger.info(f"No port number found in line: {line}")
+            self.logger.info(f"No port number found in line: {line}")
             return None
             
         try:
             return int(match.group(1))
         except ValueError as e:
-            logger.info(f"Failed to parse port from match {match.group(1)}: {e}")
+            self.logger.info(f"Failed to parse port from match {match.group(1)}: {e}")
             return None
 
     async def _find_comfy_port(self) -> Optional[int]:
         """Find the port where ComfyUI is running using lsof on macOS."""
         try:
-            logger.info("Starting port search...")
+            self.logger.info("Starting port search...")
             cmd = ["lsof", "-i", "-P", "-n"]
-            logger.info(f"Executing command: {' '.join(cmd)}")
             
             result = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -111,31 +102,28 @@ class ComfyClient:
             stdout, stderr = await result.communicate()
             
             if result.returncode != 0:
-                logger.error(f"lsof command failed with return code {result.returncode}")
-                logger.error(f"stderr: {stderr.decode()}")
+                self.logger.error(f"lsof command failed with return code {result.returncode}")
+                self.logger.error(f"stderr: {stderr.decode()}")
                 return None
                 
-            logger.info(f"lsof output: {stdout.decode()}")
-            
             # Parse the output to find listening ports
             for line in stdout.decode().splitlines():
-                logger.info(f"Processing line: {line}")
+                self.logger.debug(f"Processing line: {line}")
                 # Look for Python processes that are listening
                 if ("Python" in line or "python" in line) and "LISTEN" in line:
                     port = await self._parse_port_from_line(line)
                     if port:
-                        logger.info(f"Found potential port: {port}")
                         if await self._check_port(port):
                             return port
             
-            logger.error("No ComfyUI server found in listening ports")
+            self.logger.error("No ComfyUI server found in listening ports")
             return None
             
         except subprocess.SubprocessError as e:
-            logger.error(f"Failed to execute lsof command: {e}")
+            self.logger.error(f"Failed to execute lsof command: {e}")
             return None
         except Exception as e:
-            logger.error(f"Unexpected error while finding port: {e}")
+            self.logger.error(f"Unexpected error while finding port: {e}")
             return None
 
     async def connect(self) -> bool:
@@ -150,17 +138,17 @@ class ComfyClient:
     async def _websocket_handler(self):
         """Handle WebSocket connection and messages."""
         try:
-            async with websockets.connect(self.ws_url) as websocket:
+            async with websockets.connect(self.ws_url, logger=self.ws_logger) as websocket:
                 self.ws = websocket
                 while not self.should_stop:
                     try:
                         message = await websocket.recv()
                         await self._handle_message(message)
                     except websockets.exceptions.ConnectionClosed:
-                        logger.info("WebSocket connection closed")
+                        self.logger.info("WebSocket connection closed")
                         break
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            self.logger.error(f"WebSocket error: {e}")
 
     async def _handle_message(self, message: str):
         """Handle incoming WebSocket messages."""
@@ -174,10 +162,10 @@ class ComfyClient:
                 if data["type"] == "progress":
                     step = data["data"]["value"]
                     max_step = data["data"]["max"]
-                    logger.info(f"Step: {step} / {max_step}")
+                    self.logger.info(f"Step: {step} / {max_step}")
                 elif data["type"] == "executed" and data["data"]["node"] is None:
                     if self.current_prompt:
-                        logger.info("Image generation complete!")
+                        self.logger.info("Image generation complete!")
                         # Resolve the future for the current prompt
                         future = self.prompt_futures.get(self.current_prompt.prompt_id)
                         if future:
@@ -188,9 +176,9 @@ class ComfyClient:
                     # Log status messages for debugging
                     if "data" in data and "status" in data["data"]:
                         status = data["data"]["status"]
-                        logger.debug(f"Status message: {data}")  # Log full message
+                        self.logger.debug(f"Status message: {data}")  # Log full message
                         if status.get("exec_info", {}).get("queue_remaining", 0) == 0:
-                            logger.debug("Queue empty status received")
+                            self.logger.debug("Queue empty status received")
                             if self.current_prompt:
                                 # Resolve the future for the current prompt
                                 future = self.prompt_futures.get(self.current_prompt.prompt_id)
@@ -199,9 +187,9 @@ class ComfyClient:
                                     del self.prompt_futures[self.current_prompt.prompt_id]
                                 self.current_prompt = None
                 else:
-                    logger.debug(f"Unknown message type: {data['type']}")
+                    self.logger.debug(f"Unknown message type: {data['type']}")
                     if "data" in data:
-                        logger.debug(f"Message data: {data['data']}")
+                        self.logger.debug(f"Message data: {data['data']}")
         except json.JSONDecodeError:
             pass
 
@@ -222,7 +210,7 @@ class ComfyClient:
 
                 # Submit the prompt to the server
                 try:
-                    logger.info("Sending workflow to ComfyUI...")
+                    self.logger.info("Sending workflow to ComfyUI...")
                     async with aiohttp.ClientSession() as session:
                         async with session.post(
                             f"{self.base_url}/prompt",
@@ -231,22 +219,22 @@ class ComfyClient:
                             if response.status == 200:
                                 result = await response.json()
                                 prompt_id = result["prompt_id"]
-                                logger.info(f"Successfully queued prompt with ID: {prompt_id}")
+                                self.logger.info(f"Successfully queued prompt with ID: {prompt_id}")
                                 queued_prompt.prompt_id = prompt_id
                                 queued_prompt.queued_at = datetime.now()
                                 self.current_prompt = queued_prompt
                                 self.prompt_futures[prompt_id] = queued_prompt.future
                             else:
                                 error_text = await response.text()
-                                logger.error(f"Server returned status code: {response.status}")
-                                logger.error(f"Server response: {error_text}")
+                                self.logger.error(f"Server returned status code: {response.status}")
+                                self.logger.error(f"Server response: {error_text}")
                                 queued_prompt.future.set_exception(Exception(f"Failed to queue prompt: {error_text}"))
                 except Exception as e:
-                    logger.error(f"Failed to queue prompt: {e}")
+                    self.logger.error(f"Failed to queue prompt: {e}")
                     queued_prompt.future.set_exception(e)
 
             except Exception as e:
-                logger.error(f"Error in queue processor: {e}")
+                self.logger.error(f"Error in queue processor: {e}")
 
     def queue_prompt(self, workflow: Dict[str, Any]) -> asyncio.Future:
         """Queue a prompt and return a Future that will be resolved when the prompt completes."""
@@ -276,9 +264,56 @@ class ComfyClient:
         futures = {}
         for row in rows:
             prefix = row['output.filename_prefix']
-            updated_workflow = update_workflow(workflow, row)
+            updated_workflow = self._update_workflow(workflow, row)
             futures[prefix] = self.queue_prompt(updated_workflow)
         return futures
+
+    def _update_workflow(self, workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
+        """Update the workflow with values from the CSV row."""
+        # Create a deep copy of the workflow to avoid modifying the original
+        updated_workflow = json.loads(json.dumps(workflow))
+        
+        # Track which columns were used
+        used_columns = set()
+        
+        # Map CSV column names to node inputs
+        for node_id, node in updated_workflow.items():
+            if "_meta" in node and "title" in node["_meta"]:
+                node_title = node["_meta"]["title"].replace(" ", "_")
+                # Look for a matching CSV column
+                for column_name, value in row.items():
+                    # Split column name into node title and field name
+                    parts = column_name.split(".")
+                    if len(parts) == 2 and parts[0] == node_title:
+                        field_name = parts[1]
+                        if "inputs" in node and field_name in node["inputs"]:
+                            node["inputs"][field_name] = value
+                            used_columns.add(column_name)
+                            self.logger.debug(f"Updated node {node_id} ({node_title}) field {field_name} with value from column {column_name}")
+        
+        # Check for unused columns
+        unused_columns = set(row.keys()) - used_columns
+        if unused_columns:
+            # Find suggestions for each unused column
+            valid_node_titles = {
+                node["_meta"]["title"].replace(" ", "_")
+                for node in updated_workflow.values()
+                if "_meta" in node and "title" in node["_meta"]
+            }
+        
+            suggestions = {}
+            for col in unused_columns:
+                parts = col.split(".")
+                if len(parts) == 2:
+                    node_part = parts[0]
+                    # Find close matches for the node part
+                    matches = difflib.get_close_matches(node_part, valid_node_titles, n=3, cutoff=0.6)
+                    if matches:
+                        suggestions[col] = [f"{match}.{parts[1]}" for match in matches]
+            
+            raise UnusedColumnsError(unused_columns, suggestions)
+        
+        return updated_workflow
 
     async def wait_for_all(self, futures: Dict[str, asyncio.Future]) -> Dict[str, Any]:
         """Wait for all futures to complete and return results.
@@ -308,51 +343,4 @@ class ComfyClient:
         try:
             await asyncio.gather(self.ws_task, self.queue_task, return_exceptions=True)
         except asyncio.CancelledError:
-            pass
-
-def update_workflow(workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
-    """Update the workflow with values from the CSV row."""
-    # Create a deep copy of the workflow to avoid modifying the original
-    updated_workflow = json.loads(json.dumps(workflow))
-    
-    # Track which columns were used
-    used_columns = set()
-    
-    # Map CSV column names to node inputs
-    for node_id, node in updated_workflow.items():
-        if "_meta" in node and "title" in node["_meta"]:
-            node_title = node["_meta"]["title"].replace(" ", "_")
-            # Look for a matching CSV column
-            for column_name, value in row.items():
-                # Split column name into node title and field name
-                parts = column_name.split(".")
-                if len(parts) == 2 and parts[0] == node_title:
-                    field_name = parts[1]
-                    if "inputs" in node and field_name in node["inputs"]:
-                        node["inputs"][field_name] = value
-                        used_columns.add(column_name)
-                        logger.debug(f"Updated node {node_id} ({node_title}) field {field_name} with value from column {column_name}")
-    
-    # Check for unused columns
-    unused_columns = set(row.keys()) - used_columns
-    if unused_columns:
-        # Find suggestions for each unused column
-        valid_node_titles = {
-            node["_meta"]["title"].replace(" ", "_")
-            for node in updated_workflow.values()
-            if "_meta" in node and "title" in node["_meta"]
-        }
-    
-        suggestions = {}
-        for col in unused_columns:
-            parts = col.split(".")
-            if len(parts) == 2:
-                node_part = parts[0]
-                # Find close matches for the node part
-                matches = difflib.get_close_matches(node_part, valid_node_titles, n=3, cutoff=0.6)
-                if matches:
-                    suggestions[col] = [f"{match}.{parts[1]}" for match in matches]
-        
-        raise UnusedColumnsError(unused_columns, suggestions)
-    
-    return updated_workflow 
+            pass 
