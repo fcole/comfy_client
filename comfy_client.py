@@ -3,13 +3,12 @@ import asyncio
 import aiohttp
 import websockets
 import subprocess
-from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-import csv
 import difflib
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -66,13 +65,44 @@ class ComfyClient:
         self.base_url = f"http://{self.host}:{self.port}"
         self.ws_url = f"ws://{self.host}:{self.port}/ws"
 
+    async def _check_port(self, port: int) -> Optional[int]:
+        """Check if a port is running ComfyUI."""
+        try:
+            logger.info(f"Checking if port {port} is running ComfyUI...")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/system_stats", timeout=5) as response:
+                    logger.info(f"Response status code: {response.status}")
+                    if response.status == 200:
+                        logger.info(f"Found ComfyUI server on port {port}")
+                        return port
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.info(f"Port {port} is not running ComfyUI: {e}")
+        return None
+
+    async def _parse_port_from_line(self, line: str) -> Optional[int]:
+        """Extract and validate port number from lsof output line.
+        
+        Example line: "Python    1234 user    4u   IPv4  0x1234567890abcdef      0t0    TCP *:8188 (LISTEN)"
+        """
+        # Match port number after the last colon in the line
+        match = re.search(r':(\d+)\s*\(LISTEN\)$', line)
+        if not match:
+            logger.info(f"No port number found in line: {line}")
+            return None
+            
+        try:
+            return int(match.group(1))
+        except ValueError as e:
+            logger.info(f"Failed to parse port from match {match.group(1)}: {e}")
+            return None
+
     async def _find_comfy_port(self) -> Optional[int]:
         """Find the port where ComfyUI is running using lsof on macOS."""
         try:
             logger.info("Starting port search...")
-            # Run lsof to find Python processes listening on ports
             cmd = ["lsof", "-i", "-P", "-n"]
             logger.info(f"Executing command: {' '.join(cmd)}")
+            
             result = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -92,33 +122,11 @@ class ComfyClient:
                 logger.info(f"Processing line: {line}")
                 # Look for Python processes that are listening
                 if ("Python" in line or "python" in line) and "LISTEN" in line:
-                    # Extract port number from the line
-                    parts = line.split()
-                    if len(parts) >= 9:
-                        port_str = parts[8].split(':')[-1]
-                        try:
-                            port = int(port_str)
-                            logger.info(f"Found potential port: {port}")
-                            # Check if this port is running ComfyUI
-                            try:
-                                logger.info(f"Checking if port {port} is running ComfyUI...")
-                                async with aiohttp.ClientSession() as session:
-                                    async with session.get(f"http://127.0.0.1:{port}/system_stats", timeout=5) as response:
-                                        logger.info(f"Response status code: {response.status}")
-                                        if response.status == 200:
-                                            logger.info(f"Found ComfyUI server on port {port}")
-                                            return port
-                            except aiohttp.ClientError as e:
-                                logger.info(f"Port {port} is not running ComfyUI: {e}")
-                                continue
-                            except asyncio.TimeoutError as e:
-                                logger.info(f"Timeout checking port {port}: {e}")
-                                continue
-                        except ValueError as e:
-                            logger.info(f"Failed to parse port from {port_str}: {e}")
-                            continue
-                    else:
-                        logger.info(f"Line does not have enough parts: {line}")
+                    port = await self._parse_port_from_line(line)
+                    if port:
+                        logger.info(f"Found potential port: {port}")
+                        if await self._check_port(port):
+                            return port
             
             logger.error("No ComfyUI server found in listening ports")
             return None
