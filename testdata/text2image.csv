@@ -1,3 +1,3 @@
-positive,negative,output_filename_prefix
+positive_clip.text,negative_clip.text,output.filename_prefix
 "a photo of a cat","bad quality, low resolution","cat"
 "a photo of a dog","bad quality, low resolution","dog"

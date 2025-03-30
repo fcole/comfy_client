@@ -29,6 +29,7 @@ class ComfyClient:
         self.current_prompt_id = None
         self.processing_complete = False
         self.ws_thread = None
+        self.has_queued_prompt = False  # Track if we've queued a prompt
 
     def connect(self) -> bool:
         """Test if the ComfyUI server is running and accessible."""
@@ -70,10 +71,12 @@ class ComfyClient:
                     # Log status messages for debugging
                     if "data" in data and "status" in data["data"]:
                         status = data["data"]["status"]
-                        logger.debug(f"Status: {status}")
+                        logger.debug(f"Status message: {data}")  # Log full message
                         if status.get("exec_info", {}).get("queue_remaining", 0) == 0:
-                            self.processing_complete = True
-                            logger.info("Queue empty - generation complete!")
+                            logger.debug(f"Queue empty status received. Has queued prompt: {self.has_queued_prompt}")
+                            if self.has_queued_prompt:  # Only consider queue empty as completion if we've queued a prompt
+                                self.processing_complete = True
+                                logger.info("Queue empty - generation complete!")
                 else:
                     logger.debug(f"Unknown message type: {data['type']}")
                     if "data" in data:
@@ -98,6 +101,7 @@ class ComfyClient:
             if response.status_code == 200:
                 prompt_id = response.json()["prompt_id"]
                 logger.info(f"Successfully queued prompt with ID: {prompt_id}")
+                self.has_queued_prompt = True  # Mark that we've queued a prompt
                 return prompt_id
             else:
                 logger.error(f"Server returned status code: {response.status_code}")
@@ -186,18 +190,24 @@ def find_comfy_port() -> Optional[int]:
         logger.error(f"Unexpected error while finding port: {e}")
         return None
 
-def update_workflow(workflow: Dict[str, Any], positive_prompt: str, negative_prompt: str, output_prefix: str) -> Dict[str, Any]:
-    """Update the workflow with new prompts and output prefix."""
+def update_workflow(workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
+    """Update the workflow with values from the CSV row."""
     # Create a deep copy of the workflow to avoid modifying the original
     updated_workflow = json.loads(json.dumps(workflow))
     
-    # Update the prompts and output prefix
-    if "6" in updated_workflow:  # Positive prompt node
-        updated_workflow["6"]["inputs"]["text"] = positive_prompt
-    if "7" in updated_workflow:  # Negative prompt node
-        updated_workflow["7"]["inputs"]["text"] = negative_prompt
-    if "9" in updated_workflow:  # SaveImage node
-        updated_workflow["9"]["inputs"]["filename_prefix"] = output_prefix
+    # Map CSV column names to node inputs
+    for node_id, node in updated_workflow.items():
+        if "_meta" in node and "title" in node["_meta"]:
+            node_title = node["_meta"]["title"].lower().replace(" ", "_")
+            # Look for a matching CSV column
+            for column_name, value in row.items():
+                # Split column name into node title and field name
+                parts = column_name.split(".")
+                if len(parts) == 2 and parts[0] == node_title:
+                    field_name = parts[1]
+                    if "inputs" in node and field_name in node["inputs"]:
+                        node["inputs"][field_name] = value
+                        logger.debug(f"Updated node {node_id} ({node_title}) field {field_name} with value from column {column_name}")
     
     return updated_workflow
 
@@ -247,18 +257,8 @@ def main():
                 row_count += 1
                 logger.info(f"Processing row {row_count}: {row}")
                 
-                # Use the CSV values directly without stripping quotes
-                positive_prompt = row["positive"]
-                negative_prompt = row["negative"]
-                output_prefix = row["output_filename_prefix"]
-                
-                # Update workflow
-                updated_workflow = update_workflow(
-                    workflow,
-                    positive_prompt,
-                    negative_prompt,
-                    output_prefix
-                )
+                # Update workflow with values from the row
+                updated_workflow = update_workflow(workflow, row)
 
                 # Reset completion flag
                 client.processing_complete = False
@@ -274,7 +274,7 @@ def main():
                     logger.error("Workflow execution failed or timed out")
                     continue
 
-                logger.info(f"Successfully generated image with prefix: {output_prefix}")
+                logger.info(f"Successfully generated image with prefix: {row['output.filename_prefix']}")
 
             logger.info(f"Completed processing {row_count} rows")
             logger.info("Script finished successfully")
