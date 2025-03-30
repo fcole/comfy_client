@@ -1,2 +1,4 @@
 websocket-client>=1.6.1
-requests>=2.31.0 
+requests>=2.31.0
+aiohttp>=3.9.0
+websockets>=12.0 

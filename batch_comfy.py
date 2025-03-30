@@ -3,14 +3,17 @@
 import json
 import csv
 import time
-import websocket
-import requests
+import asyncio
+import aiohttp
+import websockets
 import sys
 import subprocess
-import threading
+import argparse
 from pathlib import Path
 from typing import Dict, Any, Optional
 import logging
+from dataclasses import dataclass
+from datetime import datetime
 
 # Configure logging
 logging.basicConfig(
@@ -19,6 +22,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Filter out websockets debug messages
+logging.getLogger('websockets').setLevel(logging.WARNING)
+logging.getLogger('websockets.client').setLevel(logging.WARNING)
+
+@dataclass
+class QueuedPrompt:
+    workflow: Dict[str, Any]
+    future: asyncio.Future
+    prompt_id: Optional[str] = None
+    queued_at: datetime = None
+
 class ComfyClient:
     def __init__(self, host: str = "127.0.0.1", port: int = 8188):
         self.host = host
@@ -26,57 +40,70 @@ class ComfyClient:
         self.base_url = f"http://{host}:{port}"
         self.ws_url = f"ws://{host}:{port}/ws"
         self.ws = None
-        self.current_prompt_id = None
-        self.processing_complete = False
-        self.ws_thread = None
-        self.has_queued_prompt = False  # Track if we've queued a prompt
+        self.prompt_queue = asyncio.Queue()
+        self.current_prompt: Optional[QueuedPrompt] = None
+        self.prompt_futures: Dict[str, asyncio.Future] = {}  # Map prompt_id to Future
+        self.should_stop = False
 
-    def connect(self) -> bool:
+    async def connect(self) -> bool:
         """Test if the ComfyUI server is running and accessible."""
         try:
-            response = requests.get(f"{self.base_url}/system_stats")
-            return response.status_code == 200
-        except requests.exceptions.ConnectionError:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.base_url}/system_stats") as response:
+                    return response.status == 200
+        except aiohttp.ClientError:
             return False
 
-    def connect_websocket(self):
-        """Establish WebSocket connection for progress updates."""
-        websocket.enableTrace(False)  # Disable trace logging
-        self.ws = websocket.WebSocketApp(
-            self.ws_url,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close
-        )
-        # Start WebSocket connection in a separate thread
-        self.ws_thread = threading.Thread(target=self.ws.run_forever)
-        self.ws_thread.daemon = True  # Thread will exit when main program exits
-        self.ws_thread.start()
+    async def _websocket_handler(self):
+        """Handle WebSocket connection and messages."""
+        try:
+            async with websockets.connect(self.ws_url) as websocket:
+                self.ws = websocket
+                while not self.should_stop:
+                    try:
+                        message = await websocket.recv()
+                        await self._handle_message(message)
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.info("WebSocket connection closed")
+                        break
+        except Exception as e:
+            logger.error(f"WebSocket error: {e}")
 
-    def _on_message(self, ws, message):
+    async def _handle_message(self, message: str):
         """Handle incoming WebSocket messages."""
         try:
             data = json.loads(message)
             if "type" in data:
-                # Skip monitoring messages
+                # Skip monitoring messages completely
                 if data["type"] == "crystools.monitor":
                     return
+                    
                 if data["type"] == "progress":
                     progress = data["data"]["value"]
                     logger.info(f"Progress: {progress}")
                 elif data["type"] == "executed" and data["data"]["node"] is None:
-                    self.processing_complete = True
-                    logger.info("Image generation complete!")
+                    if self.current_prompt:
+                        logger.info("Image generation complete!")
+                        # Resolve the future for the current prompt
+                        future = self.prompt_futures.get(self.current_prompt.prompt_id)
+                        if future:
+                            future.set_result(True)
+                            del self.prompt_futures[self.current_prompt.prompt_id]
+                        self.current_prompt = None
                 elif data["type"] == "status":
                     # Log status messages for debugging
                     if "data" in data and "status" in data["data"]:
                         status = data["data"]["status"]
                         logger.debug(f"Status message: {data}")  # Log full message
                         if status.get("exec_info", {}).get("queue_remaining", 0) == 0:
-                            logger.debug(f"Queue empty status received. Has queued prompt: {self.has_queued_prompt}")
-                            if self.has_queued_prompt:  # Only consider queue empty as completion if we've queued a prompt
-                                self.processing_complete = True
-                                logger.info("Queue empty - generation complete!")
+                            logger.debug("Queue empty status received")
+                            if self.current_prompt:
+                                # Resolve the future for the current prompt
+                                future = self.prompt_futures.get(self.current_prompt.prompt_id)
+                                if future:
+                                    future.set_result(True)
+                                    del self.prompt_futures[self.current_prompt.prompt_id]
+                                self.current_prompt = None
                 else:
                     logger.debug(f"Unknown message type: {data['type']}")
                     if "data" in data:
@@ -84,72 +111,99 @@ class ComfyClient:
         except json.JSONDecodeError:
             pass
 
-    def _on_error(self, ws, error):
-        logger.error(f"WebSocket error: {error}")
+    async def _process_queue(self):
+        """Process the queue of prompts."""
+        while not self.should_stop:
+            try:
+                # If we have a current prompt, wait for it to complete
+                if self.current_prompt:
+                    await asyncio.sleep(0.1)
+                    continue
 
-    def _on_close(self, ws, close_status_code, close_msg):
-        logger.info("WebSocket connection closed")
+                # Get next prompt from queue
+                try:
+                    queued_prompt = await asyncio.wait_for(self.prompt_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
 
-    def queue_prompt(self, workflow: Dict[str, Any]) -> Optional[str]:
-        """Submit a workflow to the ComfyUI server."""
+                # Submit the prompt to the server
+                try:
+                    logger.info("Sending workflow to ComfyUI...")
+                    async with aiohttp.ClientSession() as session:
+                        async with session.post(
+                            f"{self.base_url}/prompt",
+                            json={"prompt": queued_prompt.workflow}
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                prompt_id = result["prompt_id"]
+                                logger.info(f"Successfully queued prompt with ID: {prompt_id}")
+                                queued_prompt.prompt_id = prompt_id
+                                queued_prompt.queued_at = datetime.now()
+                                self.current_prompt = queued_prompt
+                                self.prompt_futures[prompt_id] = queued_prompt.future
+                            else:
+                                error_text = await response.text()
+                                logger.error(f"Server returned status code: {response.status}")
+                                logger.error(f"Server response: {error_text}")
+                                queued_prompt.future.set_exception(Exception(f"Failed to queue prompt: {error_text}"))
+                except Exception as e:
+                    logger.error(f"Failed to queue prompt: {e}")
+                    queued_prompt.future.set_exception(e)
+
+            except Exception as e:
+                logger.error(f"Error in queue processor: {e}")
+
+    def queue_prompt(self, workflow: Dict[str, Any]) -> asyncio.Future:
+        """Queue a prompt and return a Future that will be resolved when the prompt completes."""
+        future = asyncio.Future()
+        queued_prompt = QueuedPrompt(workflow=workflow, future=future)
+        # Use create_task to schedule the queue put operation
+        asyncio.create_task(self.prompt_queue.put(queued_prompt))
+        return future
+
+    async def start(self):
+        """Start the client's tasks."""
+        self.should_stop = False
+        # Start WebSocket handler and queue processor tasks
+        self.ws_task = asyncio.create_task(self._websocket_handler())
+        self.queue_task = asyncio.create_task(self._process_queue())
+
+    async def close(self):
+        """Close the WebSocket connection and stop the tasks."""
+        self.should_stop = True
+        if hasattr(self, 'ws_task'):
+            self.ws_task.cancel()
+        if hasattr(self, 'queue_task'):
+            self.queue_task.cancel()
         try:
-            logger.info("Sending workflow to ComfyUI...")
-            response = requests.post(
-                f"{self.base_url}/prompt",
-                json={"prompt": workflow}
-            )
-            if response.status_code == 200:
-                prompt_id = response.json()["prompt_id"]
-                logger.info(f"Successfully queued prompt with ID: {prompt_id}")
-                self.has_queued_prompt = True  # Mark that we've queued a prompt
-                return prompt_id
-            else:
-                logger.error(f"Server returned status code: {response.status_code}")
-                logger.error(f"Server response: {response.text}")
-                return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to queue prompt: {e}")
-            if hasattr(e.response, 'text'):
-                logger.error(f"Server response: {e.response.text}")
-            return None
+            await asyncio.gather(self.ws_task, self.queue_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
 
-    def wait_for_completion(self, timeout: int = 300) -> bool:
-        """Wait for the current prompt to complete."""
-        start_time = time.time()
-        logger.info("Waiting for image generation to complete...")
-        while not self.processing_complete:
-            if time.time() - start_time > timeout:
-                logger.error("Timeout waiting for image generation")
-                return False
-            time.sleep(0.1)
-        logger.info("Image generation completed successfully")
-        return True
-
-    def close(self):
-        """Close the WebSocket connection."""
-        if self.ws:
-            self.ws.close()
-        if self.ws_thread:
-            self.ws_thread.join(timeout=1.0)
-
-def find_comfy_port() -> Optional[int]:
+async def find_comfy_port() -> Optional[int]:
     """Find the port where ComfyUI is running using lsof on macOS."""
     try:
         logger.info("Starting port search...")
         # Run lsof to find Python processes listening on ports
         cmd = ["lsof", "-i", "-P", "-n"]
         logger.info(f"Executing command: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await result.communicate()
         
         if result.returncode != 0:
             logger.error(f"lsof command failed with return code {result.returncode}")
-            logger.error(f"stderr: {result.stderr}")
+            logger.error(f"stderr: {stderr.decode()}")
             return None
             
-        logger.info(f"lsof output: {result.stdout}")
+        logger.info(f"lsof output: {stdout.decode()}")
         
         # Parse the output to find listening ports
-        for line in result.stdout.splitlines():
+        for line in stdout.decode().splitlines():
             logger.info(f"Processing line: {line}")
             # Look for Python processes that are listening
             if ("Python" in line or "python" in line) and "LISTEN" in line:
@@ -163,15 +217,16 @@ def find_comfy_port() -> Optional[int]:
                         # Check if this port is running ComfyUI
                         try:
                             logger.info(f"Checking if port {port} is running ComfyUI...")
-                            response = requests.get(f"http://127.0.0.1:{port}/system_stats", timeout=5)
-                            logger.info(f"Response status code: {response.status_code}")
-                            if response.status_code == 200:
-                                logger.info(f"Found ComfyUI server on port {port}")
-                                return port
-                        except requests.exceptions.ConnectionError as e:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(f"http://127.0.0.1:{port}/system_stats", timeout=5) as response:
+                                    logger.info(f"Response status code: {response.status}")
+                                    if response.status == 200:
+                                        logger.info(f"Found ComfyUI server on port {port}")
+                                        return port
+                        except aiohttp.ClientError as e:
                             logger.info(f"Port {port} is not running ComfyUI: {e}")
                             continue
-                        except requests.exceptions.Timeout as e:
+                        except asyncio.TimeoutError as e:
                             logger.info(f"Timeout checking port {port}: {e}")
                             continue
                     except ValueError as e:
@@ -211,33 +266,44 @@ def update_workflow(workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, 
     
     return updated_workflow
 
-def main():
-    if len(sys.argv) != 3:
-        print("Usage: python batch_comfy.py <workflow.json> <prompts.csv>")
-        sys.exit(1)
+async def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Run ComfyUI workflows in batch mode')
+    parser.add_argument(
+        '--workflow',
+        type=Path,
+        default=Path('workflow/text2image.json'),
+        help='Path to the workflow JSON file'
+    )
+    parser.add_argument(
+        '--prompts',
+        type=Path,
+        default=Path('testdata/text2image.csv'),
+        help='Path to the CSV file containing prompts'
+    )
+    args = parser.parse_args()
 
-    workflow_path = Path(sys.argv[1])
-    csv_path = Path(sys.argv[2])
-
-    if not workflow_path.exists() or not csv_path.exists():
+    if not args.workflow.exists() or not args.prompts.exists():
         print("Error: One or both input files do not exist")
+        print(f"Workflow file: {args.workflow}")
+        print(f"Prompts file: {args.prompts}")
         sys.exit(1)
 
     # Find ComfyUI port
-    port = find_comfy_port()
+    port = await find_comfy_port()
     if not port:
         print("Error: Could not find running ComfyUI server")
         sys.exit(1)
 
     # Initialize client
     client = ComfyClient(port=port)
-    if not client.connect():
+    if not await client.connect():
         print("Error: Could not connect to ComfyUI server")
         sys.exit(1)
 
     # Load workflow
     try:
-        with open(workflow_path) as f:
+        with open(args.workflow) as f:
             workflow = json.load(f)
         logger.info("Successfully loaded workflow file")
     except json.JSONDecodeError:
@@ -245,14 +311,15 @@ def main():
         sys.exit(1)
 
     try:
-        # Connect WebSocket
-        logger.info("Connecting to WebSocket...")
-        client.connect_websocket()
+        # Start client tasks
+        await client.start()
 
         # Process CSV
-        with open(csv_path) as f:
+        with open(args.prompts) as f:
             reader = csv.DictReader(f)
             row_count = 0
+            futures = []
+            
             for row in reader:
                 row_count += 1
                 logger.info(f"Processing row {row_count}: {row}")
@@ -260,21 +327,25 @@ def main():
                 # Update workflow with values from the row
                 updated_workflow = update_workflow(workflow, row)
 
-                # Reset completion flag
-                client.processing_complete = False
+                # Queue the prompt and store the future
+                future = client.queue_prompt(updated_workflow)
+                futures.append((row['output.filename_prefix'], future))
 
-                # Submit workflow
-                prompt_id = client.queue_prompt(updated_workflow)
-                if not prompt_id:
-                    logger.error("Failed to submit workflow")
-                    continue
-
-                # Wait for completion
-                if not client.wait_for_completion():
-                    logger.error("Workflow execution failed or timed out")
-                    continue
-
-                logger.info(f"Successfully generated image with prefix: {row['output.filename_prefix']}")
+            # Wait for all futures to complete
+            try:
+                # Gather all futures and their prefixes
+                results = await asyncio.gather(
+                    *[future for _, future in futures],
+                    return_exceptions=True
+                )
+                # Process results and log success/failure
+                for (prefix, _), result in zip(futures, results):
+                    if isinstance(result, Exception):
+                        logger.error(f"Failed to generate image with prefix {prefix}: {result}")
+                    else:
+                        logger.info(f"Successfully generated image with prefix: {prefix}")
+            except Exception as e:
+                logger.error(f"Error waiting for futures to complete: {e}")
 
             logger.info(f"Completed processing {row_count} rows")
             logger.info("Script finished successfully")
@@ -286,8 +357,8 @@ def main():
         print(f"Unexpected error: {e}")
         sys.exit(1)
     finally:
-        # Clean up WebSocket connection
-        client.close()
+        # Clean up client
+        await client.close()
 
 if __name__ == "__main__":
-    main() 
+    asyncio.run(main()) 
