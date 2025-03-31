@@ -1,6 +1,5 @@
 import aiohttp
 import asyncio
-import subprocess
 import re
 import difflib
 import json
@@ -58,41 +57,33 @@ async def parse_port_from_line(line: str) -> Optional[int]:
 
 async def find_comfy_port() -> Optional[int]:
     """Find the port where ComfyUI is running using lsof on macOS."""
-    try:
-        logger.info("Starting port search...")
-        cmd = ["lsof", "-i", "-P", "-n"]
-        
-        result = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        stdout, stderr = await result.communicate()
-        
-        if result.returncode != 0:
-            logger.error(f"lsof command failed with return code {result.returncode}")
-            logger.error(f"stderr: {stderr.decode()}")
-            return None
-            
-        # Parse the output to find listening ports
-        for line in stdout.decode().splitlines():
-            logger.debug(f"Processing line: {line}")
-            # Look for Python processes that are listening
-            if ("Python" in line or "python" in line) and "LISTEN" in line:
-                port = await parse_port_from_line(line)
-                if port:
-                    if await check_port(port):
-                        return port
-        
-        logger.error("No ComfyUI server found in listening ports")
+    logger.info("Starting port search...")
+    cmd = ["lsof", "-i", "-P", "-n"]
+    
+    result = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+    stdout, stderr = await result.communicate()
+    
+    if result.returncode != 0:
+        logger.error(f"lsof command failed with return code {result.returncode}")
+        logger.error(f"stderr: {stderr.decode()}")
         return None
         
-    except subprocess.SubprocessError as e:
-        logger.error(f"Failed to execute lsof command: {e}")
-        return None
-    except Exception as e:
-        logger.error(f"Unexpected error while finding port: {e}")
-        return None
+    # Parse the output to find listening ports
+    for line in stdout.decode().splitlines():
+        logger.debug(f"Processing line: {line}")
+        # Look for Python processes that are listening
+        if ("Python" in line or "python" in line) and "LISTEN" in line:
+            port = await parse_port_from_line(line)
+            if port:
+                if await check_port(port):
+                    return port
+    
+    logger.error("No ComfyUI server found in listening ports")
+    return None
 
 def update_workflow(workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
     """Update the workflow with values from the CSV row."""

@@ -28,7 +28,6 @@ class ComfyClient:
         self.ws_logger.setLevel(logging.WARNING)
         self.prompt_queue = asyncio.Queue()
         self.current_prompt: Optional[QueuedPrompt] = None
-        self.prompt_futures: Dict[str, asyncio.Future] = {}  # Map prompt_id to Future
         self.should_stop = False
 
     @classmethod
@@ -77,9 +76,8 @@ class ComfyClient:
                     queue_remaining = message_data["status"]["exec_info"]["queue_remaining"]
                     if queue_remaining == 0 and self.current_prompt:
                         # Resolve the future for the current prompt
-                        future = self.prompt_futures.get(self.current_prompt.prompt_id)
+                        future = self.current_prompt.future
                         future.set_result(True)
-                        del self.prompt_futures[self.current_prompt.prompt_id]
                         self.current_prompt = None
                 else:
                     self.logger.debug(f"Unknown message type: {message_type}")
@@ -118,7 +116,6 @@ class ComfyClient:
                     queued_prompt.prompt_id = prompt_id
                     queued_prompt.queued_at = datetime.now()
                     self.current_prompt = queued_prompt
-                    self.prompt_futures[prompt_id] = queued_prompt.future
 
 
     def queue_prompt(self, workflow: Dict[str, Any]) -> asyncio.Future:
