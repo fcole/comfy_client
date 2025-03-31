@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from typing import Dict, Any
 import json
 import sys
 import asyncio
@@ -15,6 +16,24 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+async def wait_for_all(futures: Dict[str, asyncio.Future]) -> Dict[str, Any]:
+    """Wait for all futures to complete and return results.
+    
+    Args:
+        futures: Dict mapping prefixes to their futures
+        
+    Returns:
+        Dict mapping prefixes to their results (True for success, Exception for failure)
+    """
+    results = {}
+    for prefix, future in futures.items():
+        try:
+            await future
+            results[prefix] = True
+        except Exception as e:
+            results[prefix] = e
+    return results
 
 async def main():
     # Set up argument parser
@@ -45,16 +64,7 @@ async def main():
         sys.exit(1)
 
     # Initialize client
-    client = ComfyClient(port=args.port)
-    try:
-        await client.initialize()
-    except RuntimeError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-
-    if not await client.connect():
-        print("Error: Could not connect to ComfyUI server")
-        sys.exit(1)
+    client = await ComfyClient.create(port=args.port)
 
     # Load workflow
     try:
@@ -76,28 +86,29 @@ async def main():
         sys.exit(1)
 
     try:
-        # Start client tasks
-        await client.start()
-
         # Queue all prompts from the rows
         futures = client.queue_sheet(workflow, rows)
         
         # Wait for all futures to complete
-        results = await client.wait_for_all(futures)
+        results = await wait_for_all(futures)
         
         # Log results
+        success_count = 0
+        failure_count = 0
         for prefix, result in results.items():
             if isinstance(result, Exception):
                 logger.error(f"Failed to generate image with prefix {prefix}: {result}")
+                failure_count += 1
             else:
                 logger.info(f"Successfully generated image with prefix: {prefix}")
+                success_count += 1
 
         logger.info(f"Completed processing {len(results)} rows")
-        logger.info("Script finished successfully")
+        if failure_count > 0:
+            logger.error(f"Summary: {failure_count} of {len(results)} rows failed")
+        else:
+            logger.info(f"Summary: All {len(results)} rows completed successfully")
 
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        sys.exit(1)
     finally:
         # Clean up client
         await client.close()
