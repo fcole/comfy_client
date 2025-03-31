@@ -2,14 +2,11 @@ import json
 import asyncio
 import aiohttp
 import websockets
-import subprocess
 from typing import Dict, Any, Optional
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-import difflib
-import re
-
+from comfy_utils import find_comfy_port, update_workflow, UnusedColumnsError
 
 @dataclass
 class QueuedPrompt:
@@ -17,21 +14,6 @@ class QueuedPrompt:
     future: asyncio.Future
     prompt_id: Optional[str] = None
     queued_at: datetime = None
-
-class UnusedColumnsError(Exception):
-    """Exception raised when CSV contains unused columns."""
-    def __init__(self, unused_columns: set[str], suggestions: Dict[str, list[str]]):
-        self.unused_columns = unused_columns
-        self.suggestions = suggestions
-        super().__init__(self._format_message())
-
-    def _format_message(self) -> str:
-        msg = f"The following CSV columns were not used: {', '.join(self.unused_columns)}\n"
-        if self.suggestions:
-            msg += "\nDid you mean:\n"
-            for col, matches in self.suggestions.items():
-                msg += f"  {col} -> {', '.join(matches)}\n"
-        return msg
 
 class ComfyClient:
     def __init__(self, host: str = "127.0.0.1", port: Optional[int] = None):
@@ -51,80 +33,12 @@ class ComfyClient:
     async def initialize(self):
         """Initialize the client by finding the port if not specified."""
         if self.port is None:
-            self.port = await self._find_comfy_port()
+            self.port = await find_comfy_port()
             if self.port is None:
                 raise RuntimeError("Could not find running ComfyUI server")
         
         self.base_url = f"http://{self.host}:{self.port}"
         self.ws_url = f"ws://{self.host}:{self.port}/ws"
-
-    async def _check_port(self, port: int) -> Optional[int]:
-        """Check if a port is running ComfyUI."""
-        try:
-            self.logger.info(f"Checking if port {port} is running ComfyUI...")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://127.0.0.1:{port}/system_stats", timeout=5) as response:
-                    if response.status == 200:
-                        self.logger.info(f"Found ComfyUI server on port {port}")
-                        return port
-        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            self.logger.info(f"Port {port} is not running ComfyUI: {e}")
-        return None
-
-    async def _parse_port_from_line(self, line: str) -> Optional[int]:
-        """Extract and validate port number from lsof output line.
-        
-        Example line: "Python    1234 user    4u   IPv4  0x1234567890abcdef      0t0    TCP *:8188 (LISTEN)"
-        """
-        # Match port number after the last colon in the line
-        match = re.search(r':(\d+)\s*\(LISTEN\)$', line)
-        if not match:
-            self.logger.info(f"No port number found in line: {line}")
-            return None
-            
-        try:
-            return int(match.group(1))
-        except ValueError as e:
-            self.logger.info(f"Failed to parse port from match {match.group(1)}: {e}")
-            return None
-
-    async def _find_comfy_port(self) -> Optional[int]:
-        """Find the port where ComfyUI is running using lsof on macOS."""
-        try:
-            self.logger.info("Starting port search...")
-            cmd = ["lsof", "-i", "-P", "-n"]
-            
-            result = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await result.communicate()
-            
-            if result.returncode != 0:
-                self.logger.error(f"lsof command failed with return code {result.returncode}")
-                self.logger.error(f"stderr: {stderr.decode()}")
-                return None
-                
-            # Parse the output to find listening ports
-            for line in stdout.decode().splitlines():
-                self.logger.debug(f"Processing line: {line}")
-                # Look for Python processes that are listening
-                if ("Python" in line or "python" in line) and "LISTEN" in line:
-                    port = await self._parse_port_from_line(line)
-                    if port:
-                        if await self._check_port(port):
-                            return port
-            
-            self.logger.error("No ComfyUI server found in listening ports")
-            return None
-            
-        except subprocess.SubprocessError as e:
-            self.logger.error(f"Failed to execute lsof command: {e}")
-            return None
-        except Exception as e:
-            self.logger.error(f"Unexpected error while finding port: {e}")
-            return None
 
     async def connect(self) -> bool:
         """Test if the ComfyUI server is running and accessible."""
@@ -264,56 +178,9 @@ class ComfyClient:
         futures = {}
         for row in rows:
             prefix = row['output.filename_prefix']
-            updated_workflow = self._update_workflow(workflow, row)
+            updated_workflow = update_workflow(workflow, row)
             futures[prefix] = self.queue_prompt(updated_workflow)
         return futures
-
-    def _update_workflow(self, workflow: Dict[str, Any], row: Dict[str, str]) -> Dict[str, Any]:
-        """Update the workflow with values from the CSV row."""
-        # Create a deep copy of the workflow to avoid modifying the original
-        updated_workflow = json.loads(json.dumps(workflow))
-        
-        # Track which columns were used
-        used_columns = set()
-        
-        # Map CSV column names to node inputs
-        for node_id, node in updated_workflow.items():
-            if "_meta" in node and "title" in node["_meta"]:
-                node_title = node["_meta"]["title"].replace(" ", "_")
-                # Look for a matching CSV column
-                for column_name, value in row.items():
-                    # Split column name into node title and field name
-                    parts = column_name.split(".")
-                    if len(parts) == 2 and parts[0] == node_title:
-                        field_name = parts[1]
-                        if "inputs" in node and field_name in node["inputs"]:
-                            node["inputs"][field_name] = value
-                            used_columns.add(column_name)
-                            self.logger.debug(f"Updated node {node_id} ({node_title}) field {field_name} with value from column {column_name}")
-        
-        # Check for unused columns
-        unused_columns = set(row.keys()) - used_columns
-        if unused_columns:
-            # Find suggestions for each unused column
-            valid_node_titles = {
-                node["_meta"]["title"].replace(" ", "_")
-                for node in updated_workflow.values()
-                if "_meta" in node and "title" in node["_meta"]
-            }
-        
-            suggestions = {}
-            for col in unused_columns:
-                parts = col.split(".")
-                if len(parts) == 2:
-                    node_part = parts[0]
-                    # Find close matches for the node part
-                    matches = difflib.get_close_matches(node_part, valid_node_titles, n=3, cutoff=0.6)
-                    if matches:
-                        suggestions[col] = [f"{match}.{parts[1]}" for match in matches]
-            
-            raise UnusedColumnsError(unused_columns, suggestions)
-        
-        return updated_workflow
 
     async def wait_for_all(self, futures: Dict[str, asyncio.Future]) -> Dict[str, Any]:
         """Wait for all futures to complete and return results.
