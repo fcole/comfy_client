@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from comfy_utils import find_comfy_port, update_workflow, UnusedColumnsError
+from comfy_utils import find_comfy_port, update_workflow
 
 @dataclass
 class QueuedPrompt:

@@ -17,6 +17,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+def is_ui_format_workflow(workflow: Dict) -> bool:
+    """Check if a workflow JSON is in the UI format rather than API format.
+    
+    Args:
+        workflow: The workflow JSON as a dictionary
+        
+    Returns:
+        True if the workflow is in UI format, False if it's in API format
+    """
+    # UI format has these specific fields at the root level
+    ui_specific_fields = {'links', 'version', 'nodes', 'groups'}
+    return any(field in workflow for field in ui_specific_fields)
+
 async def wait_for_all(futures: Dict[str, asyncio.Future]) -> Dict[str, Any]:
     """Wait for all futures to complete and return results.
     
@@ -41,7 +54,7 @@ async def main():
     parser.add_argument(
         '--workflow',
         type=Path,
-        default=Path('workflow/text2image.json'),
+        default=Path('workflow/text2image_from_ui.json'),
         help='Path to the workflow JSON file'
     )
     parser.add_argument(
@@ -71,8 +84,14 @@ async def main():
         with open(args.workflow) as f:
             workflow = json.load(f)
         logger.info("Successfully loaded workflow file")
-    except json.JSONDecodeError:
-        print("Error: Invalid workflow JSON file")
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid workflow JSON file: {e}")
+        sys.exit(1)
+
+    # Check if workflow is in UI format
+    if is_ui_format_workflow(workflow):
+        print("Error: The workflow file appears to be in the UI format (saved using Workflow->Save As... or loaded from a .png file)."
+        " Please export the workflow in API format using Workflow->Export (API) in the ComfyUI interface instead.")
         sys.exit(1)
 
     # Read CSV file
