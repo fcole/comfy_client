@@ -30,8 +30,8 @@ async def wait_for_all(futures: Dict[str, asyncio.Future]) -> Dict[str, Any]:
     results = {}
     for prefix, future in futures.items():
         try:
-            await future
-            results[prefix] = True
+            result = await future
+            results[prefix] = result
         except Exception as e:
             results[prefix] = e
     return results
@@ -52,6 +52,12 @@ async def main():
         help='Path to the CSV file containing prompts'
     )
     parser.add_argument(
+        '--log-file',
+        type=Path,
+        default=Path('comfy_batch_log.txt'),
+        help='Path to the log file for completed workflow hashes'
+    )
+    parser.add_argument(
         '--port',
         type=int,
         help='Port number of the ComfyUI server (optional)'
@@ -61,6 +67,7 @@ async def main():
     # Expand user paths
     args.workflow = args.workflow.expanduser()
     args.prompts = args.prompts.expanduser()
+    args.log_file = args.log_file.expanduser()
 
     if not args.workflow.exists() or not args.prompts.exists():
         print("Error: One or both input files do not exist")
@@ -69,7 +76,7 @@ async def main():
         sys.exit(1)
 
     # Initialize client
-    client = await ComfyClient.create(port=args.port)
+    client = await ComfyClient.create(port=args.port, log_file=args.log_file)
 
     # Load workflow
     try:
@@ -98,25 +105,54 @@ async def main():
 
     try:
         # Queue all prompts from the rows
-        futures = client.queue_sheet(workflow, rows)
-        
+        futures = {}
+        for row in rows:
+            try:
+                updated_workflow = comfy_utils.update_workflow(workflow, row)
+            except (comfy_utils.UnusedColumnsError, comfy_utils.NoSuchInputError) as e:
+                logger.error(f"Error processing row {row}: {e}")
+                continue
+
+            workflow_hash = comfy_utils.get_workflow_hash(updated_workflow)
+            future = client.queue_prompt(updated_workflow)
+            futures[workflow_hash] = future
+
+        queued_count = len(futures)
+        logger.info(f"Queued {queued_count} new workflows.")
+
+        if not futures:
+            logger.info("No new workflows to run.")
+            return
+
         # Wait for all futures to complete
         results = await wait_for_all(futures)
         
         # Log results
         success_count = 0
         failure_count = 0
-        for prefix, result in results.items():
+        skipped_count = 0
+        for id, result in results.items():
+            if result == "skipped":
+                skipped_count += 1
+                continue
+
             if isinstance(result, Exception):
-                logger.error(f"Failed to generate image with prefix {prefix}: {result}")
+                logger.error(f"Failed to generate image with id {id[:8]}: {result}")
                 failure_count += 1
             else:
-                logger.info(f"Successfully generated image with prefix: {prefix}")
+                logger.info(f"Successfully generated image with id: {id[:8]}")
                 success_count += 1
 
-        logger.info(f"Completed processing {len(results)} rows")
-        if failure_count > 0:
-            logger.error(f"Summary: {failure_count} of {len(results)} rows failed")
+        logger.info(f"Completed processing {len(results)} workflows.")
+        if failure_count > 0 or skipped_count > 0:
+            summary = []
+            if success_count > 0:
+                summary.append(f"{success_count} succeeded")
+            if failure_count > 0:
+                summary.append(f"{failure_count} failed")
+            if skipped_count > 0:
+                summary.append(f"{skipped_count} skipped")
+            logger.info(f"Summary: {', '.join(summary)}")
         else:
             logger.info(f"Summary: All {len(results)} rows completed successfully")
 

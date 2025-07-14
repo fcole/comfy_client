@@ -6,21 +6,30 @@ from typing import Dict, Any, Optional
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from comfy_utils import find_comfy_port, update_workflow
+from pathlib import Path
+from comfy_utils import find_comfy_port, update_workflow, get_workflow_hash
 
 @dataclass
 class QueuedPrompt:
     workflow: Dict[str, Any]
     future: asyncio.Future
+    workflow_hash: str
     prompt_id: Optional[str] = None
     queued_at: datetime = None
 
 
 class ComfyClient:
-    def __init__(self, host: str, port: int):
+    def __init__(self, host: str, port: int, log_file: Optional[Path] = None):
         self.logger = logging.getLogger(__name__)
         self.host = host
         self.port = port
+        self.log_file = log_file
+        self.completed_hashes = set()
+        if self.log_file and self.log_file.exists():
+            with open(self.log_file, 'r') as f:
+                self.completed_hashes = set(line.strip() for line in f)
+            self.logger.info(f"Loaded {len(self.completed_hashes)} completed hashes from {self.log_file}")
+
         self.base_url = f"http://{host}:{port}"
         self.ws_url = f"ws://{host}:{port}/ws"
         self.ws = None
@@ -31,13 +40,13 @@ class ComfyClient:
         self.should_stop = False
 
     @classmethod
-    async def create(cls, host: str = "127.0.0.1", port: Optional[int] = None):
+    async def create(cls, host: str = "127.0.0.1", port: Optional[int] = None, log_file: Optional[Path] = None):
         """Initialize the client by finding the port if not specified."""
         port = port or await find_comfy_port()
         if port is None:
             raise RuntimeError("Could not find running ComfyUI server")
         
-        client = cls(host, port)
+        client = cls(host, port, log_file)
         client.ws_task = asyncio.create_task(client._websocket_handler())
         client.queue_task = asyncio.create_task(client._process_queue())
 
@@ -78,6 +87,15 @@ class ComfyClient:
                         # Resolve the future for the current prompt
                         future = self.current_prompt.future
                         future.set_result(True)
+
+                        # Log successful completion
+                        if self.log_file:
+                            workflow_hash = self.current_prompt.workflow_hash
+                            with open(self.log_file, 'a') as f:
+                                f.write(f"{workflow_hash}\n")
+                            self.completed_hashes.add(workflow_hash)
+                            self.logger.info(f"Logged completed workflow: {workflow_hash[:8]}...")
+
                         self.current_prompt = None
                 else:
                     self.logger.debug(f"Unknown message type: {message_type}")
@@ -120,28 +138,19 @@ class ComfyClient:
 
     def queue_prompt(self, workflow: Dict[str, Any]) -> asyncio.Future:
         """Queue a prompt and return a Future that will be resolved when the prompt completes."""
+        workflow_hash = get_workflow_hash(workflow)
+
+        if workflow_hash in self.completed_hashes:
+            self.logger.info(f"Skipping workflow with hash {workflow_hash[:8]}... as it's already completed.")
+            future = asyncio.Future()
+            future.set_result("skipped")
+            return future
+
         future = asyncio.Future()
-        queued_prompt = QueuedPrompt(workflow=workflow, future=future)
+        queued_prompt = QueuedPrompt(workflow=workflow, future=future, workflow_hash=workflow_hash)
         # Use create_task to schedule the queue put operation
         asyncio.create_task(self.prompt_queue.put(queued_prompt))
         return future
-
-
-    def queue_sheet(self, workflow: Dict[str, Any], rows: list[Dict[str, str]]) -> Dict[str, asyncio.Future]:
-        """Queue all rows for processing.
-        
-        Args:
-            workflow: The base workflow to use
-            rows: List of dictionaries, where each dictionary represents a row of data
-            
-        Returns:
-            Dict mapping from hash of the workflow to the future
-        """
-        futures = {}
-        for row in rows:
-            updated_workflow = update_workflow(workflow, row)
-            futures[hash(json.dumps(updated_workflow))] = self.queue_prompt(updated_workflow)
-        return futures
 
 
     async def close(self):

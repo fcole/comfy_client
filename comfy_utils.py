@@ -5,8 +5,13 @@ import difflib
 import json
 from typing import Dict, Any, Optional
 import logging
+import hashlib
 
 logger = logging.getLogger(__name__)
+
+def get_workflow_hash(workflow: Dict[str, Any]) -> str:
+    """Calculate a stable hash for a workflow dictionary."""
+    return hashlib.sha256(json.dumps(workflow, sort_keys=True).encode()).hexdigest()
 
 def is_ui_format_workflow(workflow: Dict) -> bool:
     """Check if a workflow JSON is in the UI format rather than API format.
