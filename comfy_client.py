@@ -135,13 +135,12 @@ class ComfyClient:
             rows: List of dictionaries, where each dictionary represents a row of data
             
         Returns:
-            Dict mapping filename prefixes to their futures
+            Dict mapping from hash of the workflow to the future
         """
         futures = {}
         for row in rows:
-            prefix = row['output.filename_prefix']
             updated_workflow = update_workflow(workflow, row)
-            futures[prefix] = self.queue_prompt(updated_workflow)
+            futures[hash(json.dumps(updated_workflow))] = self.queue_prompt(updated_workflow)
         return futures
 
 
