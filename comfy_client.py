@@ -2,7 +2,7 @@ import json
 import asyncio
 import aiohttp
 import websockets
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -58,6 +58,47 @@ class ComfyClient:
 
         return client
 
+    async def _check_prompt_history(self, prompt_id: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check the history of a prompt to see if it was successful.
+        Returns a tuple of (success, message). Message is an error message on failure.
+        """
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{self.base_url}/history/{prompt_id}") as response:
+                if response.status != 200:
+                    error_msg = f"Failed to get history for prompt {prompt_id}: {response.status} {await response.text()}"
+                    self.logger.error(error_msg)
+                    return False, error_msg
+
+                history = await response.json()
+                prompt_history = history.get(prompt_id)
+
+                if not prompt_history:
+                    warning_msg = f"Prompt {prompt_id} not found in history."
+                    self.logger.warning(warning_msg)
+                    return False, warning_msg
+
+                if 'status' in prompt_history:
+                    status = prompt_history['status']
+                    if status.get('status_str') == 'error' or not status.get('completed'):
+                        messages = status.get('messages', [])
+                        error_message = 'Unknown error'
+                        for msg in messages:
+                            if msg[0] == 'execution_error':
+                                error_message = msg[1].get('exception_message', 'Unknown error')
+                                break
+                        self.logger.error(f"Prompt {prompt_id} failed with error: {error_message}")
+                        return False, error_message
+
+                if 'outputs' in prompt_history and prompt_history['outputs']:
+                    self.logger.info(f"Prompt {prompt_id} completed successfully.")
+                    return True, None
+
+                # Fallback if no explicit error but also no output
+                warning_msg = f"Prompt {prompt_id} completed with no outputs and no explicit error status."
+                self.logger.warning(warning_msg)
+                return False, warning_msg
+
     async def _websocket_handler(self):
         """Handle WebSocket connection and messages."""
         async with websockets.connect(self.ws_url, logger=self.ws_logger) as websocket:
@@ -84,17 +125,26 @@ class ComfyClient:
                     # Log status messages for debugging
                     queue_remaining = message_data["status"]["exec_info"]["queue_remaining"]
                     if queue_remaining == 0 and self.current_prompt:
-                        # Resolve the future for the current prompt
-                        future = self.current_prompt.future
-                        future.set_result(True)
+                        prompt_id = self.current_prompt.prompt_id
+                        if prompt_id is None:
+                            self.logger.error("Current prompt has no ID, cannot check history.")
+                            self.current_prompt.future.set_exception(Exception("Prompt has no ID, cannot check history."))
+                            self.current_prompt = None
+                            continue
 
-                        # Log successful completion
-                        if self.log_file:
-                            workflow_hash = self.current_prompt.workflow_hash
-                            with open(self.log_file, 'a') as f:
-                                f.write(f"{workflow_hash}\n")
-                            self.completed_hashes.add(workflow_hash)
-                            self.logger.info(f"Logged completed workflow: {workflow_hash[:8]}...")
+                        success, result_message = await self._check_prompt_history(prompt_id)
+                        if success:
+                            self.current_prompt.future.set_result(True)
+
+                            # Log successful completion
+                            if self.log_file:
+                                workflow_hash = self.current_prompt.workflow_hash
+                                with open(self.log_file, 'a') as f:
+                                    f.write(f"{workflow_hash}\n")
+                                self.completed_hashes.add(workflow_hash)
+                                self.logger.info(f"Logged completed workflow: {workflow_hash[:8]}...")
+                        else:
+                            self.current_prompt.future.set_exception(Exception(result_message))
 
                         self.current_prompt = None
                 else:
@@ -141,7 +191,6 @@ class ComfyClient:
         workflow_hash = get_workflow_hash(workflow)
 
         if workflow_hash in self.completed_hashes:
-            self.logger.info(f"Skipping workflow with hash {workflow_hash[:8]}... as it's already completed.")
             future = asyncio.Future()
             future.set_result("skipped")
             return future

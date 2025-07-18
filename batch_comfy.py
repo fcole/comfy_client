@@ -106,6 +106,7 @@ async def main():
     try:
         # Queue all prompts from the rows
         futures = {}
+        skipped_count = 0
         for row in rows:
             try:
                 updated_workflow = comfy_utils.update_workflow(workflow, row)
@@ -115,6 +116,10 @@ async def main():
 
             workflow_hash = comfy_utils.get_workflow_hash(updated_workflow)
             future = client.queue_prompt(updated_workflow)
+            # if future is already completed, skip it
+            if future.done() and future.result() == "skipped":
+                skipped_count += 1
+                continue
             futures[workflow_hash] = future
 
         queued_count = len(futures)
@@ -130,12 +135,7 @@ async def main():
         # Log results
         success_count = 0
         failure_count = 0
-        skipped_count = 0
         for id, result in results.items():
-            if result == "skipped":
-                skipped_count += 1
-                continue
-
             if isinstance(result, Exception):
                 logger.error(f"Failed to generate image with id {id[:8]}: {result}")
                 failure_count += 1
